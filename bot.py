@@ -1,12 +1,16 @@
 # Импорт необходимых библиотек
+from dotenv import load_dotenv
+load_dotenv()
+
 import logging  # Для логирования работы бота
 import os  # Для работы с переменными окружения и файловой системой
+import base64
 import sqlite3  # Для работы с SQLite базой данных
 from datetime import datetime  # Для работы с датой и временем
 
 import pandas as pd  # Для обработки данных и экспорта в Excel
 from docx import Document  # Для создания Word-документов
-from github import Github  # Для взаимодействия с GitHub API
+from github import Github, UnknownObjectException, GithubException  # Для взаимодействия с GitHub API
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup  # Компоненты Telegram Bot API
 from telegram.ext import (
     Application,
@@ -18,12 +22,11 @@ from telegram.ext import (
     CallbackQueryHandler
 )  # Обработчики команд и сообщений
 
-
-# Конфигурационные параметры (берутся из переменных окружения)
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # Токен бота
+# Конфиdoгурационные параметры (берутся из переменных окружения)
+TOKEN = os.getenv('TELEGRAM_TOKEN')  # Токен бота
 ADMIN_IDS = [429442647]  # Список ID администраторов
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')  # Токен для доступа к GitHub
-REPO_NAME = os.getenv('GITHUB_REPO')  # Название репозитория GitHub
+REPO_NAME = os.getenv('GITHUB_REPO_URL')  # Название репозитория GitHub
 DB_FILE = "repair_requests.db"  # Название файла базы данных
 
 # Определение состояний для ConversationHandler
@@ -102,10 +105,32 @@ cancel_keyboard = InlineKeyboardMarkup([
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     user = update.effective_user
-    await update.message.reply_text(
+    text = (
         f"Привет, {user.first_name}! Я бот для оформления заявок на ремонт.\n"
-        "Напишите 'ремонт' или нажмите /new_request"
+        "Доступные команды:\n"
+        "/new_request - создать новую заявку\n"
+        "/help - справка по использованию"
     )
+
+    # Добавляем команду экспорта для админов
+    if user.id in ADMIN_IDS:
+        text += "\n/export - экспорт данных (только для администраторов)"
+
+    await update.message.reply_text(text)
+
+async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    help_text = (
+        "🔧 Этот бот помогает создавать заявки на ремонт бытовой техники.\n\n"
+        "Основные команды:\n"
+        "/start - начать работу с ботом\n"
+        "/new_request - создать новую заявку\n"
+        "/help - показать эту справку\n\n"
+        "Вы также можете использовать текстовые команды:\n"
+        "'ремонт' - начать новую заявку\n"
+        "'помощь' - показать справку"
+    )
+    await update.message.reply_text(help_text)
 
 async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало создания новой заявки"""
@@ -157,22 +182,18 @@ async def time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Экспорт данных (доступно только администраторам)"""
     if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Доступ запрещен")
+        await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды")
         return
-
-    # Клавиатура с вариантами экспорта
-    keyboard = [
-        [
-            InlineKeyboardButton("Excel", callback_data='export_excel'),
-            InlineKeyboardButton("Word", callback_data='export_doc'),
-            InlineKeyboardButton("Text", callback_data='export_txt')
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
         "Выберите формат экспорта:",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Excel", callback_data='export_excel'),
+                InlineKeyboardButton("Word", callback_data='export_doc')
+            ],
+            [InlineKeyboardButton("Text", callback_data='export_txt')]
+        ])
     )
 
 async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -247,19 +268,73 @@ async def export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def sync_with_github(context: ContextTypes.DEFAULT_TYPE):
     """Синхронизация базы данных с GitHub"""
-    g = Github(GITHUB_TOKEN)
-    repo = g.get_repo(REPO_NAME)
+    try:
+        # Проверка наличия обязательных переменных
+        if not GITHUB_TOKEN or not REPO_NAME:
+            raise ValueError("Missing GitHub credentials in environment variables")
 
-    with open(DB_FILE, 'rb') as f:
-        content = f.read()
+        # Инициализация подключения
+        g = Github(GITHUB_TOKEN)
 
-    # Создание нового коммита с базой данных
-    repo.create_file(
-        path=DB_FILE,
-        message=f"Auto-sync {datetime.now()}",
-        content=content,
-        branch="main"
-    )
+        try:
+            repo = g.get_repo(REPO_NAME)
+        except UnknownObjectException:
+            raise ValueError(f"Repository {REPO_NAME} not found")
+
+        # Проверка существования локального файла
+        if not os.path.exists(DB_FILE):
+            raise FileNotFoundError(f"Local database file {DB_FILE} not found")
+
+        # Чтение и кодирование содержимого файла
+        with open(DB_FILE, 'rb') as f:
+            content = f.read()
+        encoded_content = base64.b64encode(content).decode('utf-8')
+
+        # Попытка обновления существующего файла
+        try:
+            contents = repo.get_contents(DB_FILE, ref="main")
+            update_result = repo.update_file(
+                path=DB_FILE,
+                message="Automatic DB sync",
+                content=encoded_content,
+                sha=contents.sha,
+                branch="main"
+            )
+            logging.info(f"File updated: {update_result['commit'].html_url}")
+
+        except UnknownObjectException:
+            # Создание нового файла если не существует
+            create_result = repo.create_file(
+                path=DB_FILE,
+                message="Automatic DB sync",
+                content=encoded_content,
+                branch="main"
+            )
+            logging.info(f"File created: {create_result['commit'].html_url}")
+
+    except GithubException as ge:
+        logging.error(f"GitHub API Error: {ge.data.get('message')}")
+        # Можно добавить уведомление админу через Telegram
+        await context.bot.send_message(
+            chat_id=ADMIN_IDS[0],
+            text=f"⚠️ GitHub sync failed: {ge.data.get('message')}"
+        )
+
+    except FileNotFoundError as fe:
+        logging.error(f"Local file error: {str(fe)}")
+
+    except ValueError as ve:
+        logging.error(f"Configuration error: {str(ve)}")
+
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        await context.bot.send_message(
+            chat_id=ADMIN_IDS[0],
+            text=f"⚠️ Critical sync error: {str(e)}"
+        )
+
+    else:
+        logging.info("Database sync completed successfully")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -306,6 +381,7 @@ def main():
 
     # Регистрация обработчиков команд
     application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('help', show_help))
     application.add_handler(CommandHandler('export', export_data))
     application.add_handler(CallbackQueryHandler(export_callback, pattern="^export_"))
     application.add_handler(conv_handler)
